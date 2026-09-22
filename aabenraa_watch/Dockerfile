@@ -7,4 +7,4 @@ RUN pip install uv && uv sync --no-dev
 
 COPY frontdesk_watch.py ./
 
-CMD ["uv", "run", "frontdesk_watch"]
+CMD ["uv", "run", "python", "frontdesk_watch.py"]
