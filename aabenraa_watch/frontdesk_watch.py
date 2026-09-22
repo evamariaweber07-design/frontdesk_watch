@@ -52,9 +52,9 @@ class Config:
     interval_seconds: int = 30
     jitter_seconds: int = 10
 
-    cutoff_year: int = 2027
-    cutoff_month: int = 12
-    cutoff_day: int = 31  # catch all slots through end of 2027
+    cutoff_year: int = 2026
+    cutoff_month: int = 11
+    cutoff_day: int = 30  # catch all slots through end of 2027
 
     seen_file: str = "seen_slots.json"
     headless: bool = True
