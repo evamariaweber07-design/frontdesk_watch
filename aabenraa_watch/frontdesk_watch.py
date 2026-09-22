@@ -211,6 +211,11 @@ async def main_async():
                 print(err_msg)
                 telegram_send(err_msg)
 
+        try:
+            requests.get("https://hc-ping.com/4d8cd572-9f5d-4079-b9e9-4f67c907abf4", timeout=10)
+        except Exception:
+            pass
+
         await asyncio.sleep(cfg.interval_seconds + random.randint(0, cfg.jitter_seconds))
 
 
