@@ -59,7 +59,7 @@ def slots_fingerprint(slots: List[datetime]) -> str:
 
 @dataclass
 class Config:
-    interval_seconds: int = 60
+    interval_seconds: int = 120
     jitter_seconds: int = 15
 
     cutoff_year: int = 2026
@@ -134,7 +134,12 @@ async def get_slots_for_url(url: str, headless: bool) -> List[datetime]:
         context = await browser.new_context()
         page = await context.new_page()
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except PlaywrightTimeoutError:
+            await context.close()
+            await browser.close()
+            return []
 
         try:
             await page.wait_for_selector("div.date.one-queue", timeout=20000)
@@ -202,7 +207,9 @@ async def main_async():
                     last_fingerprint[name] = fp
 
             except Exception as e:
-                print(f"{datetime.now().isoformat(sep=' ', timespec='seconds')} [{name}] error: {e}")
+                err_msg = f"{datetime.now().isoformat(sep=' ', timespec='seconds')} [{name}] error: {e}"
+                print(err_msg)
+                telegram_send(err_msg)
 
         await asyncio.sleep(cfg.interval_seconds + random.randint(0, cfg.jitter_seconds))
 
