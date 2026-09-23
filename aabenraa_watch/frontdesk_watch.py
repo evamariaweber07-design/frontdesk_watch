@@ -64,7 +64,7 @@ class Config:
 
     cutoff_year: int = 2026
     cutoff_month: int = 11
-    cutoff_day: int = 30
+    cutoff_day: int = 20
 
     seen_file: str = "seen_slots.json"
     headless: bool = True
