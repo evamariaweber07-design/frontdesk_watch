@@ -63,8 +63,8 @@ class Config:
     jitter_seconds: int = 15
 
     cutoff_year: int = 2026
-    cutoff_month: int = 11
-    cutoff_day: int = 20
+    cutoff_month: int = 12
+    cutoff_day: int = 31
 
     seen_file: str = "seen_slots.json"
     headless: bool = True
