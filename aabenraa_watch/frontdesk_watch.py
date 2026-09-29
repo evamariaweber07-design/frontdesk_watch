@@ -3,7 +3,7 @@ import json
 import os
 import requests
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, date
 from typing import List, Set, Dict, Optional
 import hashlib
@@ -12,7 +12,7 @@ import threading
 
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Browser, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
 
 BASE = "https://reservation.frontdesksuite.com"
@@ -46,9 +46,6 @@ BOOKING_WINDOWS = [
     (date(2026, 11, 2),  date(2026, 11, 7)),
 ]
 
-# Telegram update polling state
-_pending_code: Optional[str] = None
-_pending_code_lock = threading.Lock()
 _last_update_id: int = 0
 
 
@@ -93,8 +90,7 @@ def telegram_get_updates(offset: int = 0) -> list:
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     try:
         r = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10)
-        data = r.json()
-        return data.get("result", [])
+        return r.json().get("result", [])
     except Exception:
         return []
 
@@ -163,7 +159,7 @@ class BookingDetails:
 
 @dataclass
 class Config:
-    interval_seconds: int = 60
+    interval_seconds: int = 30
     jitter_seconds: int = 15
 
     cutoff_year: int = 2026
@@ -176,7 +172,7 @@ class Config:
     telegram_min_interval_seconds: int = 30 * 60
     telegram_max_items: int = 10
 
-    code_timeout_seconds: int = 600  # 10 min to reply with code
+    code_timeout_seconds: int = 600
 
 
 def cutoff_date(cfg: Config) -> date:
@@ -249,246 +245,194 @@ def is_in_booking_window(dt: datetime) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Slot scraping
+# Slot scraping — reuses a single browser context, one page at a time
 # ---------------------------------------------------------------------------
 
-async def get_slots_for_url(url: str, headless: bool) -> List[datetime]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context()
-        page = await context.new_page()
-
+async def get_slots(url: str, context: BrowserContext) -> List[datetime]:
+    page = await context.new_page()
+    try:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except PlaywrightTimeoutError:
-            await context.close()
-            await browser.close()
             return []
 
         try:
             await page.wait_for_selector("div.date.one-queue", timeout=20000)
         except PlaywrightTimeoutError:
-            html = await page.content()
-            await context.close()
-            await browser.close()
-            return parse_times_from_html(html)
+            pass
 
         html = await page.content()
-        slots = parse_times_from_html(html)
-
-        await context.close()
-        await browser.close()
-        return slots
+        return parse_times_from_html(html)
+    finally:
+        await page.close()
 
 
 # ---------------------------------------------------------------------------
-# Booking flow
+# Booking flow — also reuses the shared browser context, one page at a time
 # ---------------------------------------------------------------------------
 
-async def attempt_booking(slot: datetime, details: BookingDetails, cfg: Config) -> bool:
-    """
-    Navigate to the booking page, click the target slot, fill the form,
-    handle the 4-digit email code via Telegram, and confirm.
-    Returns True on success.
-    """
+async def attempt_booking(slot: datetime, details: BookingDetails, cfg: Config, context: BrowserContext) -> bool:
     slot_label = slot.isoformat(sep=" ", timespec="minutes")
     telegram_send(f"Slot found in booking window: {slot_label}\nAttempting to book now...")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=cfg.headless)
-        context = await browser.new_context()
-        page = await context.new_page()
+    page = await context.new_page()
+    try:
+        # 1. Load the calendar page
+        await page.goto(NO_WITNESSES_URL, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_selector("div.date.one-queue", timeout=20000)
 
-        try:
-            # 1. Load the calendar page
-            await page.goto(NO_WITNESSES_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_selector("div.date.one-queue", timeout=20000)
+        # 2. Click the matching time slot
+        clicked = False
+        day_divs = await page.query_selector_all("div.date.one-queue")
+        for day_div in day_divs:
+            header = await day_div.query_selector("span.header-text")
+            if not header:
+                continue
+            header_text = await header.inner_text()
+            try:
+                parsed_day = dtparser.parse(header_text, fuzzy=True).date()
+            except Exception:
+                continue
+            if parsed_day != slot.date():
+                continue
 
-            # 2. Click the matching time slot
-            # Slots are rendered as <span class="available-time"> inside day blocks.
-            # We match by day header text and time text.
-            target_date_str = slot.strftime("%-d")  # day without leading zero
-            target_time_str = slot.strftime("%H:%M")
-
-            clicked = False
-            day_divs = await page.query_selector_all("div.date.one-queue")
-            for day_div in day_divs:
-                header = await day_div.query_selector("span.header-text")
-                if not header:
-                    continue
-                header_text = await header.inner_text()
+            time_spans = await day_div.query_selector_all("span.available-time")
+            for ts in time_spans:
+                t_text = (await ts.inner_text()).strip()
                 try:
-                    parsed_day = dtparser.parse(header_text, fuzzy=True).date()
+                    parsed_time = dtparser.parse(f"{parsed_day.isoformat()} {t_text}", fuzzy=True)
+                    if parsed_time.replace(second=0, microsecond=0) == slot:
+                        await ts.click()
+                        clicked = True
+                        break
                 except Exception:
                     continue
-                if parsed_day != slot.date():
-                    continue
+            if clicked:
+                break
 
-                time_spans = await day_div.query_selector_all("span.available-time")
-                for ts in time_spans:
-                    t_text = (await ts.inner_text()).strip()
-                    try:
-                        parsed_time = dtparser.parse(
-                            f"{parsed_day.isoformat()} {t_text}", fuzzy=True
-                        )
-                        if parsed_time.replace(second=0, microsecond=0) == slot:
-                            await ts.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-                if clicked:
-                    break
-
-            if not clicked:
-                telegram_send(f"Could not find slot {slot_label} on the calendar page — it may have been taken.")
-                await context.close()
-                await browser.close()
-                return False
-
-            # 3. Wait for the booking form
-            await page.wait_for_selector("input[type='text'], input[type='email']", timeout=15000)
-
-            # 4. Fill form fields using exact IDs from the page HTML
-            await page.locator("#email").fill(details.email)
-            await page.locator("#field9238").fill(details.case_number)
-
-            # Part 1
-            await page.locator("#field9243").fill(details.p1_name)
-            await page.locator("#field9244").fill(details.p1_dob)
-            await page.locator("#field9242").fill(details.p1_email)
-
-            # Part 2
-            await page.locator("#field9229").fill(details.p2_name)
-            await page.locator("#field9241").fill(details.p2_dob)
-            await page.locator("#field9247").fill(details.p2_email)
-
-            # 5. Language checkbox — English is id="3307field9245", only check if not already checked
-            lang_id_map = {"english": "3307field9245", "danish": "3303field9245", "german": "3304field9245"}
-            lang_id = lang_id_map.get(details.language, "3307field9245")
-            lang_cb = page.locator(f"#{lang_id}")
-            if not await lang_cb.is_checked():
-                await lang_cb.check()
-
-            # 6. "Both understand" → Yes radio, id="3305field9246"
-            yes_radio = page.locator("#3305field9246")
-            if not await yes_radio.is_checked():
-                await yes_radio.check()
-
-            # 7. Click Confirm
-            await page.locator("#submit-btn").click()
-
-            # 8. Wait for 4-digit code screen
-            try:
-                await page.wait_for_selector(
-                    "input[maxlength='4'], input[placeholder*='code' i], input[placeholder*='kode' i]",
-                    timeout=15000
-                )
-            except PlaywrightTimeoutError:
-                # Check if we're already on a success page
-                content = await page.content()
-                if "confirm" in content.lower() or "success" in content.lower() or "thank" in content.lower():
-                    telegram_send(f"Booking confirmed (no code needed)!\nSlot: {slot_label}")
-                    await context.close()
-                    await browser.close()
-                    return True
-                telegram_send(f"Unexpected page after Confirm — could not find code input.\nSlot: {slot_label}")
-                await context.close()
-                await browser.close()
-                return False
-
-            # 9. Ask user for the code via Telegram
-            telegram_send(
-                f"Booking in progress for {slot_label}.\n"
-                f"A 4-digit code has been sent to {details.email}.\n"
-                f"Reply here with the 4-digit code within 10 minutes."
-            )
-
-            # 10. Poll Telegram for the reply
-            code = await asyncio.get_event_loop().run_in_executor(
-                None, poll_for_code, cfg.code_timeout_seconds
-            )
-
-            if not code:
-                telegram_send(f"No code received within {cfg.code_timeout_seconds // 60} minutes. Booking aborted.")
-                await context.close()
-                await browser.close()
-                return False
-
-            # 11. Enter the code
-            code_input = page.locator(
-                "input[maxlength='4'], input[placeholder*='code' i], input[placeholder*='kode' i]"
-            ).first
-            await code_input.fill(code)
-
-            # Submit the code form
-            await page.locator("#submit-btn").click()
-
-            async def screenshot_and_send(caption: str):
-                img = await page.screenshot(full_page=True)
-                telegram_send_photo(img, caption=caption)
-
-            # 12. Wait for the post-code confirmation page (shows booking details, needs one more click)
-            try:
-                await page.wait_for_selector(
-                    "button:has-text('Confirm'), button[type='submit']",
-                    timeout=15000
-                )
-            except PlaywrightTimeoutError:
-                # Already on final page or something unexpected — fall through to check below
-                pass
-
-            # Screenshot the intermediate confirmation page and send it
-            await screenshot_and_send(f"Step 1 of 2: booking details confirmation — {slot_label}")
-
-            # If the submit button is still present, this is the intermediate confirmation page — click it
-            return_home = page.locator("a:has-text('Return to Home'), button:has-text('Return to Home')")
-            confirm_btn = page.locator("#submit-btn")
-
-            if not await return_home.is_visible(timeout=3000) and await confirm_btn.is_visible(timeout=3000):
-                await confirm_btn.click()
-
-            # 13. Wait for the final confirmation page
-            try:
-                await page.wait_for_selector(
-                    "text=Your appointment, text=reservation code, text=Return to Home",
-                    timeout=15000
-                )
-            except PlaywrightTimeoutError:
-                pass
-
-            # Screenshot the final page regardless and send it
-            await screenshot_and_send(f"Final confirmation — {slot_label}")
-
-            content = await page.content()
-            if any(w in content.lower() for w in ["reservation code", "your appointment", "confirmed", "return to home"]):
-                telegram_send(
-                    f"Booking CONFIRMED!\nSlot: {slot_label}\n"
-                    f"See screenshot above for your reservation code.\n"
-                    f"A confirmation email will also be sent to {details.email}."
-                )
-                await context.close()
-                await browser.close()
-                return True
-            else:
-                telegram_send(
-                    f"Code submitted but final confirmation unclear. "
-                    f"See screenshot above and check {details.email}."
-                )
-                await context.close()
-                await browser.close()
-                return False
-
-        except Exception as e:
-            err = f"Booking error for {slot_label}: {e}"
-            print(err)
-            telegram_send(err)
-            try:
-                await context.close()
-                await browser.close()
-            except Exception:
-                pass
+        if not clicked:
+            telegram_send(f"Could not find slot {slot_label} on the calendar — it may have been taken.")
             return False
+
+        # 3. Wait for the booking form
+        await page.wait_for_selector("input[type='text'], input[type='email']", timeout=15000)
+
+        # 4. Fill form fields using exact IDs
+        await page.locator("#email").fill(details.email)
+        await page.locator("#field9238").fill(details.case_number)
+
+        # Part 1
+        await page.locator("#field9243").fill(details.p1_name)
+        await page.locator("#field9244").fill(details.p1_dob)
+        await page.locator("#field9242").fill(details.p1_email)
+
+        # Part 2
+        await page.locator("#field9229").fill(details.p2_name)
+        await page.locator("#field9241").fill(details.p2_dob)
+        await page.locator("#field9247").fill(details.p2_email)
+
+        # 5. Language checkbox
+        lang_id_map = {"english": "3307field9245", "danish": "3303field9245", "german": "3304field9245"}
+        lang_id = lang_id_map.get(details.language, "3307field9245")
+        lang_cb = page.locator(f"#{lang_id}")
+        if not await lang_cb.is_checked():
+            await lang_cb.check()
+
+        # 6. "Both understand" → Yes radio
+        yes_radio = page.locator("#3305field9246")
+        if not await yes_radio.is_checked():
+            await yes_radio.check()
+
+        # 7. Click Confirm
+        await page.locator("#submit-btn").click()
+
+        # 8. Wait for 4-digit code screen
+        try:
+            await page.wait_for_selector(
+                "input[maxlength='4'], input[placeholder*='code' i], input[placeholder*='kode' i]",
+                timeout=15000
+            )
+        except PlaywrightTimeoutError:
+            content = await page.content()
+            if any(w in content.lower() for w in ["confirm", "success", "thank"]):
+                telegram_send(f"Booking confirmed (no code needed)!\nSlot: {slot_label}")
+                return True
+            telegram_send(f"Unexpected page after Confirm — could not find code input.\nSlot: {slot_label}")
+            return False
+
+        # 9. Ask user for the code via Telegram
+        telegram_send(
+            f"Booking in progress for {slot_label}.\n"
+            f"A 4-digit code has been sent to {details.email}.\n"
+            f"Reply here with the 4-digit code within 10 minutes."
+        )
+
+        # 10. Poll Telegram for the reply (runs in a thread so the event loop stays free)
+        code = await asyncio.get_event_loop().run_in_executor(
+            None, poll_for_code, cfg.code_timeout_seconds
+        )
+
+        if not code:
+            telegram_send(f"No code received within {cfg.code_timeout_seconds // 60} minutes. Booking aborted.")
+            return False
+
+        # 11. Enter the code and submit
+        code_input = page.locator(
+            "input[maxlength='4'], input[placeholder*='code' i], input[placeholder*='kode' i]"
+        ).first
+        await code_input.fill(code)
+        await page.locator("#submit-btn").click()
+
+        async def screenshot_and_send(caption: str):
+            img = await page.screenshot(full_page=True)
+            telegram_send_photo(img, caption=caption)
+
+        # 12. Wait for the intermediate confirmation page, screenshot it, then click Confirm
+        try:
+            await page.wait_for_selector("#submit-btn", timeout=15000)
+        except PlaywrightTimeoutError:
+            pass
+
+        await screenshot_and_send(f"Step 1 of 2: booking details — {slot_label}")
+
+        return_home = page.locator("a:has-text('Return to Home'), button:has-text('Return to Home')")
+        confirm_btn = page.locator("#submit-btn")
+        if not await return_home.is_visible(timeout=3000) and await confirm_btn.is_visible(timeout=3000):
+            await confirm_btn.click()
+
+        # 13. Wait for the final confirmation page and screenshot it
+        try:
+            await page.wait_for_selector(
+                "text=Your appointment, text=reservation code, text=Return to Home",
+                timeout=15000
+            )
+        except PlaywrightTimeoutError:
+            pass
+
+        await screenshot_and_send(f"Final confirmation — {slot_label}")
+
+        content = await page.content()
+        if any(w in content.lower() for w in ["reservation code", "your appointment", "confirmed", "return to home"]):
+            telegram_send(
+                f"Booking CONFIRMED!\nSlot: {slot_label}\n"
+                f"See screenshot above for your reservation code.\n"
+                f"A confirmation email will also be sent to {details.email}."
+            )
+            return True
+        else:
+            telegram_send(
+                f"Code submitted but final confirmation unclear. "
+                f"See screenshot above and check {details.email}."
+            )
+            return False
+
+    except Exception as e:
+        err = f"Booking error for {slot_label}: {e}"
+        print(err)
+        telegram_send(err)
+        return False
+    finally:
+        await page.close()
 
 
 # ---------------------------------------------------------------------------
@@ -514,77 +458,86 @@ async def main_async():
     if not details.is_configured():
         print("WARNING: Booking env vars not fully set — auto-booking disabled.")
 
-    while True:
-        for bt in BOOKING_TYPES:
-            name = bt["name"]
-            try:
-                slots = await get_slots_for_url(bt["url"], cfg.headless)
-                good = [s for s in slots if is_before_cutoff(s, cfg)]
-
-                now_str = datetime.now().isoformat(sep=" ", timespec="seconds")
-                print(f"\n{now_str} [{name}] — {len(good)} slot(s) before cutoff")
-                for s in good:
-                    print("   ", s.isoformat(sep=" "))
-
-                for s in good:
-                    k = f"{name}|{s.isoformat()}"
-                    if k not in seen:
-                        seen.add(k)
-                if good:
-                    save_seen(cfg.seen_file, seen)
-
-                # Auto-book logic: only for "No witnesses", only in booking windows
-                if (
-                    bt["auto_book"]
-                    and details.is_configured()
-                    and not booking_in_progress
-                    and not booking_succeeded
-                ):
-                    window_slots = [s for s in good if is_in_booking_window(s)]
-                    if window_slots:
-                        target = window_slots[0]  # earliest slot in window
-                        booking_in_progress = True
-                        success = await attempt_booking(target, details, cfg)
-                        booking_in_progress = False
-                        if success:
-                            booking_succeeded = True
-                            telegram_send("Bot stopping after successful booking.")
-                            return  # stop the bot — job done
-
-                # Telegram notifications for watchers
-                fp = slots_fingerprint(good)
-                now_ts = time.time()
-
-                should_notify_change = bool(good) and (fp != last_fingerprint[name])
-                should_notify_reminder = bool(good) and (fp == last_fingerprint[name]) and (
-                    (now_ts - last_sent_at[name]) >= cfg.telegram_min_interval_seconds
-                )
-
-                if should_notify_change or should_notify_reminder:
-                    header = (
-                        f"[{name}] Slots available (changed):"
-                        if should_notify_change
-                        else f"[{name}] Slots still available:"
-                    )
-                    lines = [header]
-                    lines += [f"- {s.isoformat(sep=' ', timespec='minutes')}" for s in good[:cfg.telegram_max_items]]
-                    if len(good) > cfg.telegram_max_items:
-                        lines.append(f"(+{len(good) - cfg.telegram_max_items} more)")
-                    telegram_send("\n".join(lines))
-                    last_sent_at[name] = now_ts
-                    last_fingerprint[name] = fp
-
-            except Exception as e:
-                err_msg = f"{datetime.now().isoformat(sep=' ', timespec='seconds')} [{name}] error: {e}"
-                print(err_msg)
-                telegram_send(err_msg)
+    async with async_playwright() as p:
+        browser: Browser = await p.chromium.launch(headless=cfg.headless)
+        context: BrowserContext = await browser.new_context()
 
         try:
-            requests.get("https://hc-ping.com/4d8cd572-9f5d-4079-b9e9-4f67c907abf4", timeout=10)
-        except Exception:
-            pass
+            while True:
+                for bt in BOOKING_TYPES:
+                    name = bt["name"]
+                    try:
+                        slots = await get_slots(bt["url"], context)
+                        good = [s for s in slots if is_before_cutoff(s, cfg)]
 
-        await asyncio.sleep(cfg.interval_seconds + random.randint(0, cfg.jitter_seconds))
+                        now_str = datetime.now().isoformat(sep=" ", timespec="seconds")
+                        print(f"\n{now_str} [{name}] — {len(good)} slot(s) before cutoff")
+                        for s in good:
+                            print("   ", s.isoformat(sep=" "))
+
+                        for s in good:
+                            k = f"{name}|{s.isoformat()}"
+                            if k not in seen:
+                                seen.add(k)
+                        if good:
+                            save_seen(cfg.seen_file, seen)
+
+                        # Auto-book: only "No witnesses", only in booking windows
+                        if (
+                            bt["auto_book"]
+                            and details.is_configured()
+                            and not booking_in_progress
+                            and not booking_succeeded
+                        ):
+                            window_slots = [s for s in good if is_in_booking_window(s)]
+                            if window_slots:
+                                target = window_slots[0]
+                                booking_in_progress = True
+                                success = await attempt_booking(target, details, cfg, context)
+                                booking_in_progress = False
+                                if success:
+                                    booking_succeeded = True
+                                    telegram_send("Bot stopping after successful booking.")
+                                    return
+
+                        # Telegram slot notifications
+                        fp = slots_fingerprint(good)
+                        now_ts = time.time()
+
+                        should_notify_change = bool(good) and (fp != last_fingerprint[name])
+                        should_notify_reminder = bool(good) and (fp == last_fingerprint[name]) and (
+                            (now_ts - last_sent_at[name]) >= cfg.telegram_min_interval_seconds
+                        )
+
+                        if should_notify_change or should_notify_reminder:
+                            header = (
+                                f"[{name}] Slots available (changed):"
+                                if should_notify_change
+                                else f"[{name}] Slots still available:"
+                            )
+                            lines = [header]
+                            lines += [f"- {s.isoformat(sep=' ', timespec='minutes')}" for s in good[:cfg.telegram_max_items]]
+                            if len(good) > cfg.telegram_max_items:
+                                lines.append(f"(+{len(good) - cfg.telegram_max_items} more)")
+                            telegram_send("\n".join(lines))
+                            last_sent_at[name] = now_ts
+                            last_fingerprint[name] = fp
+
+                    except Exception as e:
+                        err_msg = f"{datetime.now().isoformat(sep=' ', timespec='seconds')} [{name}] error: {e}"
+                        print(err_msg)
+                        telegram_send(err_msg)
+
+                try:
+                    requests.get("https://hc-ping.com/4d8cd572-9f5d-4079-b9e9-4f67c907abf4", timeout=10)
+                except Exception:
+                    pass
+
+                await asyncio.sleep(cfg.interval_seconds + random.randint(0, cfg.jitter_seconds))
+
+        finally:
+            await context.close()
+            await browser.close()
 
 
 def run():
