@@ -251,8 +251,10 @@ def is_in_booking_window(dt: datetime) -> bool:
 async def get_slots(url: str, context: BrowserContext) -> List[datetime]:
     page = await context.new_page()
     try:
+        # Append a cache-busting timestamp so the server always returns a fresh page
+        busted_url = f"{url}&_={int(time.time())}"
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(busted_url, wait_until="domcontentloaded", timeout=30000)
         except PlaywrightTimeoutError:
             return []
 
@@ -460,7 +462,9 @@ async def main_async():
 
     async with async_playwright() as p:
         browser: Browser = await p.chromium.launch(headless=cfg.headless)
-        context: BrowserContext = await browser.new_context()
+        context: BrowserContext = await browser.new_context(
+            extra_http_headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"}
+        )
 
         try:
             while True:
