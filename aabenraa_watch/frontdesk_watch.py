@@ -12,7 +12,7 @@ import threading
 
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
-from playwright.async_api import async_playwright, Browser, BrowserContext, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page as PlaywrightPage, TimeoutError as PlaywrightTimeoutError
 
 
 BASE = "https://reservation.frontdesksuite.com"
@@ -248,15 +248,20 @@ def is_in_booking_window(dt: datetime) -> bool:
 # Slot scraping — reuses a single browser context, one page at a time
 # ---------------------------------------------------------------------------
 
-async def get_slots(url: str, context: BrowserContext) -> List[datetime]:
+async def get_slots(url: str, context: BrowserContext, keep_page_if_bookable: bool = False):
+    """
+    Returns (slots, page) where page is the live Playwright page if
+    keep_page_if_bookable=True and a bookable slot was found, else None.
+    Caller is responsible for closing the page when keep_page_if_bookable=True.
+    """
     page = await context.new_page()
     try:
-        # Append a cache-busting timestamp so the server always returns a fresh page
         busted_url = f"{url}&_={int(time.time())}"
         try:
             await page.goto(busted_url, wait_until="domcontentloaded", timeout=30000)
         except PlaywrightTimeoutError:
-            return []
+            await page.close()
+            return [], None
 
         try:
             await page.wait_for_selector("div.date.one-queue", timeout=20000)
@@ -264,26 +269,30 @@ async def get_slots(url: str, context: BrowserContext) -> List[datetime]:
             pass
 
         html = await page.content()
-        return parse_times_from_html(html)
-    finally:
+        slots = parse_times_from_html(html)
+
+        if keep_page_if_bookable:
+            bookable = [s for s in slots if is_in_booking_window(s)]
+            if bookable:
+                return slots, page  # caller must close this page
+
         await page.close()
+        return slots, None
+    except Exception:
+        await page.close()
+        raise
 
 
 # ---------------------------------------------------------------------------
-# Booking flow — also reuses the shared browser context, one page at a time
+# Booking flow — receives the already-loaded calendar page, clicks slot on it
 # ---------------------------------------------------------------------------
 
-async def attempt_booking(slot: datetime, details: BookingDetails, cfg: Config, context: BrowserContext) -> bool:
+async def attempt_booking(slot: datetime, details: BookingDetails, cfg: Config, page: PlaywrightPage) -> bool:
     slot_label = slot.isoformat(sep=" ", timespec="minutes")
     telegram_send(f"Slot found in booking window: {slot_label}\nAttempting to book now...")
 
-    page = await context.new_page()
     try:
-        # 1. Load the calendar page
-        await page.goto(NO_WITNESSES_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_selector("div.date.one-queue", timeout=20000)
-
-        # 2. Click the matching time slot
+        # 1. Calendar page is already loaded — click the matching time slot directly
         clicked = False
         day_divs = await page.query_selector_all("div.date.one-queue")
         for day_div in day_divs:
@@ -471,7 +480,10 @@ async def main_async():
                 for bt in BOOKING_TYPES:
                     name = bt["name"]
                     try:
-                        slots = await get_slots(bt["url"], context)
+                        slots, live_page = await get_slots(
+                            bt["url"], context,
+                            keep_page_if_bookable=bt["auto_book"] and details.is_configured() and not booking_in_progress and not booking_succeeded
+                        )
                         good = [s for s in slots if is_before_cutoff(s, cfg)]
 
                         now_str = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -494,15 +506,20 @@ async def main_async():
                             and not booking_succeeded
                         ):
                             window_slots = [s for s in good if is_in_booking_window(s)]
-                            if window_slots:
+                            if window_slots and live_page:
                                 target = window_slots[0]
                                 booking_in_progress = True
-                                success = await attempt_booking(target, details, cfg, context)
+                                success = await attempt_booking(target, details, cfg, live_page)
+                                live_page = None  # attempt_booking closes the page
                                 booking_in_progress = False
                                 if success:
                                     booking_succeeded = True
                                     telegram_send("Bot stopping after successful booking.")
                                     return
+
+                        if live_page:
+                            await live_page.close()
+                            live_page = None
 
                         # Telegram slot notifications
                         fp = slots_fingerprint(good)
