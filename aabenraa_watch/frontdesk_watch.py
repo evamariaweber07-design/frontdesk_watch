@@ -250,9 +250,11 @@ def is_in_booking_window(dt: datetime) -> bool:
 
 async def get_slots(url: str, context: BrowserContext, keep_page_if_bookable: bool = False):
     """
-    Returns (slots, page) where page is the live Playwright page if
-    keep_page_if_bookable=True and a bookable slot was found, else None.
-    Caller is responsible for closing the page when keep_page_if_bookable=True.
+    Returns (slots, page, element_handle) where:
+    - page is the live Playwright page (caller must close) if keep_page_if_bookable=True
+      and a bookable slot was found, else None
+    - element_handle is the span.available-time ElementHandle for the first bookable slot,
+      so attempt_booking can click it directly without re-matching by text
     """
     page = await context.new_page()
     try:
@@ -261,7 +263,7 @@ async def get_slots(url: str, context: BrowserContext, keep_page_if_bookable: bo
             await page.goto(busted_url, wait_until="domcontentloaded", timeout=30000)
         except PlaywrightTimeoutError:
             await page.close()
-            return [], None
+            return [], None, None
 
         try:
             await page.wait_for_selector("div.date.one-queue", timeout=20000)
@@ -274,10 +276,20 @@ async def get_slots(url: str, context: BrowserContext, keep_page_if_bookable: bo
         if keep_page_if_bookable:
             bookable = [s for s in slots if is_in_booking_window(s)]
             if bookable:
-                return slots, page  # caller must close this page
+                # Collect all span.available-time handles in DOM order — they match
+                # the order of slots returned by parse_times_from_html, so we can
+                # look up the handle by index without any text re-parsing.
+                all_handles = await page.query_selector_all("div.date.one-queue span.available-time")
+                target = bookable[0]
+                try:
+                    target_idx = slots.index(target)
+                    target_handle = all_handles[target_idx] if target_idx < len(all_handles) else None
+                except (ValueError, IndexError):
+                    target_handle = None
+                return slots, page, target_handle  # caller must close this page
 
         await page.close()
-        return slots, None
+        return slots, None, None
     except Exception:
         await page.close()
         raise
@@ -287,42 +299,20 @@ async def get_slots(url: str, context: BrowserContext, keep_page_if_bookable: bo
 # Booking flow — receives the already-loaded calendar page, clicks slot on it
 # ---------------------------------------------------------------------------
 
-async def attempt_booking(slot: datetime, details: BookingDetails, cfg: Config, page: PlaywrightPage) -> bool:
+async def attempt_booking(slot: datetime, details: BookingDetails, cfg: Config, page: PlaywrightPage, slot_handle=None) -> bool:
     slot_label = slot.isoformat(sep=" ", timespec="minutes")
     telegram_send(f"Slot found in booking window: {slot_label}\nAttempting to book now...")
 
     try:
-        # 1. Calendar page is already loaded — click the matching time slot directly
-        clicked = False
-        day_divs = await page.query_selector_all("div.date.one-queue")
-        for day_div in day_divs:
-            header = await day_div.query_selector("span.header-text")
-            if not header:
-                continue
-            header_text = await header.inner_text()
+        # 1. Click the exact element handle captured during scraping — no re-matching needed
+        if slot_handle:
             try:
-                parsed_day = dtparser.parse(header_text, fuzzy=True).date()
-            except Exception:
-                continue
-            if parsed_day != slot.date():
-                continue
-
-            time_spans = await day_div.query_selector_all("span.available-time")
-            for ts in time_spans:
-                t_text = (await ts.inner_text()).strip()
-                try:
-                    parsed_time = dtparser.parse(f"{parsed_day.isoformat()} {t_text}", fuzzy=True)
-                    if parsed_time.replace(second=0, microsecond=0) == slot:
-                        await ts.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if clicked:
-                break
-
-        if not clicked:
-            telegram_send(f"Could not find slot {slot_label} on the calendar — it may have been taken.")
+                await slot_handle.click()
+            except Exception as e:
+                telegram_send(f"Could not click slot {slot_label} — it may have been taken. ({e})")
+                return False
+        else:
+            telegram_send(f"No element handle for slot {slot_label} — cannot book.")
             return False
 
         # 3. Wait for the booking form
@@ -480,7 +470,7 @@ async def main_async():
                 for bt in BOOKING_TYPES:
                     name = bt["name"]
                     try:
-                        slots, live_page = await get_slots(
+                        slots, live_page, slot_handle = await get_slots(
                             bt["url"], context,
                             keep_page_if_bookable=bt["auto_book"] and details.is_configured() and not booking_in_progress and not booking_succeeded
                         )
@@ -509,7 +499,7 @@ async def main_async():
                             if window_slots and live_page:
                                 target = window_slots[0]
                                 booking_in_progress = True
-                                success = await attempt_booking(target, details, cfg, live_page)
+                                success = await attempt_booking(target, details, cfg, live_page, slot_handle)
                                 live_page = None  # attempt_booking closes the page
                                 booking_in_progress = False
                                 if success:
